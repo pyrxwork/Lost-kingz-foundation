@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lost Kings 30-Day Tracker</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase CDNs (Required for Database and Auth) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, collection, query, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL VARIABLES (Provided by the environment) ---
+        // DO NOT change these lines. They are automatically managed.
+        const rawAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        // The environment sometimes provides an appId with slashes (e.g., 'c_id/file.html-hash').
+        // We sanitize it to use only the first segment as the Firestore document ID to fix the "odd number of segments" error.
+        const appId = rawAppId.split('/')[0]; 
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // --- APPLICATION CONSTANTS ---
+        const CHALLENGE_START_DATE = new Date('2025-11-01T00:00:00');
+
+        const ARCHETYPES = [
+            { key: 'king', title: 'King', prompt: 'Today I sharpened my masculine King by...' },
+            { key: 'priest', title: 'Priest', prompt: 'Today I practiced my masculine Priest by...' },
+            { key: 'poet', title: 'Poet', prompt: 'Today I showed my masculine Poet by...' },
+            { key: 'jester', title: 'Jester', prompt: 'Today I fed my masculine Jester by...' },
+            { key: 'warrior', title: 'Warrior', prompt: 'Today I trained my masculine Warrior by...' },
+        ];
+
+        // --- GLOBAL STATE ---
+        let db;
+        let auth;
+        let userId = null;
+        let logs = [];
+        let dailyLog = {};
+        let hasLoggedToday = false;
+        let currentPage = 'home';
+        let challengeDay = 1;
+
+        // --- UTILITY FUNCTIONS ---
+        const getCurrentChallengeDay = (startDate) => {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            startDate.setHours(0, 0, 0, 0);
+
+            const timeDiff = today.getTime() - startDate.getTime();
+            const dayDiff = Math.ceil(timeDiff / (1000 * 3600 * 24)) + 1;
+            return Math.min(Math.max(1, dayDiff), 30);
+        };
+
+        const getLogDocId = (day) => `Day-${day}`;
+        const getChallengeDayStatus = () => challengeDay >= 1 && challengeDay <= 30;
+        const todayDateString = new Date().toLocaleDateString('en-US');
+
+        // --- FIREBASE INITIALIZATION & AUTH ---
+
+        const initializeAppAndAuth = async () => {
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    throw new Error("Firebase config not available. Check environment setup.");
+                }
+
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Determine the user's ID
+                const user = await new Promise(resolve => {
+                    onAuthStateChanged(auth, (user) => {
+                        resolve(user);
+                    });
+                });
+
+                if (user) {
+                    userId = user.uid;
+                } else {
+                    if (initialAuthToken) {
+                        const credential = await signInWithCustomToken(auth, initialAuthToken);
+                        userId = credential.user.uid;
+                    } else {
+                        const credential = await signInAnonymously(auth);
+                        userId = credential.user.uid;
+                    }
+                }
+                
+                // Calculate day and initialize listeners
+                challengeDay = getCurrentChallengeDay(CHALLENGE_START_DATE);
+                setupFirestoreListener();
+                render();
+
+            } catch (e) {
+                console.error("Firebase Initialization Error:", e);
+                document.getElementById('app').innerHTML = `<div class="p-8 text-center text-red-500 bg-gray-900 min-h-screen">FATAL ERROR: ${e.message}</div>`;
+            }
+        };
+
+        // --- FIREBASE LISTENER ---
+
+        const setupFirestoreListener = () => {
+            if (!db || !userId) return;
+
+            // Path is now constructed using the sanitized appId
+            const logsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/challenge_logs`);
+            
+            // onSnapshot listens for real-time updates
+            onSnapshot(logsCollectionRef, (snapshot) => {
+                logs = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data(),
+                    day: parseInt(doc.id.replace('Day-', ''), 10)
+                }));
+
+                // Sort logs by day number for display
+                logs.sort((a, b) => a.day - b.day);
+
+                // Check today's status
+                hasLoggedToday = logs.some(log => log.date === todayDateString);
+                
+                // If not logged, initialize the daily log state
+                if (!hasLoggedToday) {
+                    dailyLog = ARCHETYPES.reduce((acc, current) => {
+                        acc[current.key] = '';
+                        return acc;
+                    }, {});
+                } else {
+                    dailyLog = {}; // Clear form
+                }
+
+                render(); // Re-render the UI on data change
+            }, (e) => {
+                console.error("Firestore Snapshot Error:", e);
+                // Non-fatal error, display message but keep app running
+            });
+        };
+
+        // --- EVENT HANDLERS ---
+
+        const navigateTo = (page) => {
+            currentPage = page;
+            render();
+        };
+
+        const handleInputChange = (key, value) => {
+            dailyLog[key] = value;
+        };
+
+        const handleLogSubmit = async () => {
+            if (!db || !userId) return;
+            if (hasLoggedToday) return;
+
+            const docId = getLogDocId(challengeDay);
+            
+            const isAnyFieldFilled = Object.values(dailyLog).some(val => val && val.trim() !== '');
+
+            if (!isAnyFieldFilled) {
+                alertUser("Please fill out at least one archetype reflection before submitting.", "red");
+                return;
+            }
+
+            const logEntry = {
+                date: todayDateString,
+                day: challengeDay,
+                entries: dailyLog,
+                timestamp: Date.now(),
+                userId: userId, 
+            };
+
+            try {
+                // 1. Private Log Submission
+                const docRef = doc(db, `artifacts/${appId}/users/${userId}/challenge_logs`, docId);
+                await setDoc(docRef, logEntry);
+                
+                // 2. Public Status Submission (for Brother Iron accountability)
+                const publicLogRef = doc(db, `artifacts/${appId}/public/data/daily_status`, `${userId}-${docId}`);
+                await setDoc(publicLogRef, { 
+                    userId, 
+                    day: challengeDay, 
+                    date: todayDateString, 
+                    status: 'Complete', 
+                    timestamp: logEntry.timestamp 
+                });
+
+                alertUser(`Success! Day ${challengeDay} logged.`, "green");
+                navigateTo('home');
+
+            } catch (e) {
+                console.error("Error writing document: ", e);
+                alertUser("Failed to save your log. Please try again.", "red");
+            }
+        };
+
+        // --- UI RENDERING ---
+
+        const alertUser = (message, color) => {
+            const alertBox = document.getElementById('alert-box');
+            alertBox.textContent = message;
+            alertBox.className = `p-3 mb-4 rounded-lg text-white font-semibold ${color === 'green' ? 'bg-green-700' : 'bg-red-700'}`;
+            setTimeout(() => {
+                alertBox.className = "hidden";
+            }, 5000);
+        };
+
+        const renderNavButton = (page, label, icon) => {
+            const isActive = currentPage === page;
+            return `
+                <button onclick="window.app.navigateTo('${page}')"
+                    class="px-4 py-2 rounded-lg transition duration-200 text-sm font-semibold 
+                    ${isActive
+                        ? 'bg-yellow-700 text-white shadow-lg'
+                        : 'bg-gray-800 text-gray-300 hover:bg-yellow-600 hover:text-white'
+                    }"
+                >
+                    <span class="mr-1">${icon}</span> ${label}
+                </button>
+            `;
+        };
+
+        const renderHeader = () => `
+            <div class="flex justify-between items-center p-4 bg-gray-900 shadow-lg border-b border-yellow-600">
+                <h1 class="text-3xl font-serif text-yellow-500 tracking-wider">Lost Kings</h1>
+                <div class="flex space-x-4">
+                    ${renderNavButton('home', 'Home', '👑')}
+                    ${renderNavButton('log', 'Daily Forge', '🔥')}
+                    ${renderNavButton('history', 'Growth Log', '📈')}
+                </div>
+            </div>
+        `;
+
+        const renderHomePage = () => {
+            const isActive = getChallengeDayStatus();
+            const statusText = hasLoggedToday 
+                ? '<span class="text-green-400 font-bold">LOGGED & COMPLETE</span>' 
+                : '<span class="text-red-400 font-bold">PENDING SUBMISSION</span>';
+
+            const buttonDisabled = hasLoggedToday || !isActive;
+            const buttonClass = buttonDisabled
+                ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                : 'bg-red-700 text-white hover:bg-red-800 shadow-md hover:shadow-lg';
+            const buttonText = hasLoggedToday ? '✅ LOG FOR TODAY SUBMITTED' : '🔥 START DAILY FORGE';
+            
+            const dayContent = isActive ? 
+                `<div class="text-6xl font-extrabold text-white">
+                    DAY <span class="text-yellow-500">${challengeDay}</span> / 30
+                </div>
+                <p class="text-gray-400 mt-2">The work continues. You are not the same man.</p>`
+                : `<div class="text-4xl text-yellow-600 font-bold">
+                    ${challengeDay < 1 ? 'CHALLENGE PENDING' : 'CHALLENGE COMPLETE!'}
+                    ${challengeDay < 1 ? '<p class="text-lg text-gray-400 mt-2">Starts Nov 1st. Prepare your mind, body, and soul.</p>' : ''}
+                </div>`;
+
+
+            return `
+                <div class="p-6">
+                    <div class="bg-gray-800 p-8 rounded-xl shadow-2xl border-t-4 border-yellow-600 mb-8">
+                        <h2 class="text-4xl font-bold text-yellow-400 mb-2">Iron Sharpens Iron Challenge</h2>
+                        <p class="text-gray-300 text-xl">The Forge of Discipline</p>
+                        <div class="mt-6 text-center">
+                            ${dayContent}
+                        </div>
+                    </div>
+
+                    <div class="bg-gray-700 p-6 rounded-xl shadow-xl">
+                        <h3 class="text-2xl font-semibold text-white mb-4 border-b border-gray-600 pb-2">Your Accountability</h3>
+                        <p class="text-lg text-gray-300 mb-4">
+                            Today's Status: ${statusText}
+                        </p>
+
+                        <button
+                            onclick="window.app.navigateTo('log')"
+                            ${buttonDisabled ? 'disabled' : ''}
+                            class="w-full py-3 rounded-lg text-lg font-bold transition duration-300 ${buttonClass}"
+                        >
+                            ${buttonText}
+                        </button>
+
+                        <div class="mt-6 p-4 bg-gray-800 rounded-lg text-sm">
+                            <p class="text-yellow-500 font-semibold">Your Brother Iron ID (Share for pairing):</p>
+                            <p class="text-gray-300 break-all">${userId || 'Loading...'}</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderDailyLogPage = () => {
+            if (!getChallengeDayStatus()) {
+                 return `
+                    <div class="p-6">
+                        <div class="bg-red-700 p-6 rounded-xl text-center shadow-lg">
+                            <h2 class="text-3xl text-white font-bold">Challenge is not currently active.</h2>
+                            <p class="text-white mt-2">The 30-Day Challenge runs from Day 1 to Day 30 only.</p>
+                        </div>
+                    </div>
+                `;
+            }
+
+            if (hasLoggedToday) {
+                return `
+                    <div class="p-6">
+                        <div class="bg-green-700 p-6 rounded-xl text-center shadow-lg">
+                            <h2 class="text-3xl text-white font-bold">You have already submitted Day ${challengeDay}!</h2>
+                            <p class="text-white mt-2">Review your growth in the **Growth Log**.</p>
+                            <button onclick="window.app.navigateTo('history')" class="mt-4 px-4 py-2 bg-white text-green-700 rounded-lg font-semibold">Go to Growth Log</button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            const archetypeInputs = ARCHETYPES.map(({ key, title, prompt }) => `
+                <div class="bg-gray-800 p-4 rounded-lg border-l-4 border-yellow-600 shadow-md">
+                    <label class="block text-xl font-semibold text-yellow-400 mb-2">${title}</label>
+                    <p class="text-gray-400 text-sm mb-2">${prompt}</p>
+                    <textarea
+                        id="input-${key}"
+                        oninput="window.app.handleInputChange('${key}', this.value)"
+                        rows="3"
+                        class="w-full p-3 bg-gray-900 text-white rounded-md border border-gray-700 focus:ring-yellow-500 focus:border-yellow-500"
+                        placeholder="Describe your actions today for the ${title} archetype..."
+                    >${dailyLog[key] || ''}</textarea>
+                </div>
+            `).join('');
+
+            return `
+                <div class="p-6">
+                    <h2 class="text-3xl font-bold text-white mb-6">Daily Forge: Day ${challengeDay}</h2>
+                    <p class="text-gray-400 mb-6">Forge your identity by logging your actions for each of the five archetypes today. No excuses, only results.</p>
+                    <div class="space-y-6">
+                        ${archetypeInputs}
+                    </div>
+                    <button
+                        onclick="window.app.handleLogSubmit()"
+                        class="mt-8 w-full py-4 bg-red-700 text-white text-xl font-bold rounded-lg hover:bg-red-800 transition duration-300 shadow-xl"
+                    >
+                        SUBMIT DAY ${challengeDay} LOG
+                    </button>
+                </div>
+            `;
+        };
+
+        const renderHistoryPage = () => {
+            const logEntries = logs.map((log) => {
+                const archetypeDetails = ARCHETYPES.map(({ key, title }) => `
+                    <dt class="font-semibold text-white mt-1">${title}:</dt>
+                    <dd class="text-sm ml-2 pl-2 border-l border-gray-600 italic">
+                        ${log.entries[key] || '<span class="text-gray-500">No entry recorded.</span>'}
+                    </dd>
+                `).join('');
+
+                return `
+                    <div class="bg-gray-800 p-4 rounded-lg shadow-lg border-l-4 border-yellow-600">
+                        <div class="flex justify-between items-center mb-2 border-b border-gray-700 pb-2">
+                            <h3 class="text-xl font-bold text-yellow-400">DAY ${log.day}</h3>
+                            <p class="text-sm text-gray-400">${log.date}</p>
+                        </div>
+                        <dl class="space-y-2 text-gray-300">
+                            ${archetypeDetails}
+                        </dl>
+                    </div>
+                `;
+            }).join('');
+
+            const content = logs.length === 0 ? `
+                <div class="text-center p-8 bg-gray-800 rounded-lg text-gray-400">
+                    <p class="text-xl">No logs submitted yet. Start forging your first entry!</p>
+                </div>
+            ` : `<div class="space-y-4">${logEntries}</div>`;
+
+            return `
+                <div class="p-6">
+                    <h2 class="text-3xl font-bold text-white mb-6">Growth Log: All Entries</h2>
+                    <p class="text-gray-400 mb-6">Review your commitment over the last 30 days. Iron doesn't sharpen alone—this proves you faced the friction.</p>
+                    ${content}
+                </div>
+            `;
+        };
+
+        const renderPageContent = () => {
+            switch (currentPage) {
+                case 'log':
+                    return renderDailyLogPage();
+                case 'history':
+                    return renderHistoryPage();
+                case 'home':
+                default:
+                    return renderHomePage();
+            }
+        };
+
+        const render = () => {
+            const appDiv = document.getElementById('app');
+            appDiv.innerHTML = `
+                <div class="min-h-screen bg-gray-950 font-sans">
+                    ${renderHeader()}
+                    <main class="max-w-4xl mx-auto pb-12">
+                        <div id="alert-box" class="hidden"></div>
+                        ${renderPageContent()}
+                    </main>
+                </div>
+            `;
+        };
+        
+        // Expose global functions for HTML inline event handlers
+        window.app = {
+            navigateTo,
+            handleInputChange,
+            handleLogSubmit
+        };
+        
+        // Start the application
+        document.addEventListener('DOMContentLoaded', initializeAppAndAuth);
+
+    </script>
+    <style>
+        /* Custom font for branding */
+        @import url('https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700&display=swap');
+        .font-serif {
+            font-family: 'Cinzel Decorative', serif;
+        }
+    </style>
+</head>
+<body>
+    <!-- Main container for the application -->
+    <div id="app" class="min-h-screen">
+         <div class="flex flex-col items-center justify-center h-screen bg-gray-900 text-white">
+            <div class="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-yellow-500"></div>
+            <p class="mt-4 text-xl">Forging the Connection...</p>
+        </div>
+    </div>
+</body>
+</html>
