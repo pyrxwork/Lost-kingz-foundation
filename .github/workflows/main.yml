@@ -1,0 +1,26 @@
+name: Deploy to Firebase Hosting
+
+on:
+  # Triggers the deployment on pushes to the 'main' branch
+  push:
+    branches:
+      - main 
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This is the action that deploys your code
+      - name: Deploy to Firebase
+        uses: FirebaseExtended/action-hosting-deploy@v0.10.0
+        with:
+          # This uses GitHub's built-in token for authentication, fixing the red X error.
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          
+          # Your Firebase Project ID
+          projectId: 'lost-kingz-30-day-challe-df0dc'
+          
+          # This tells the action to look for the 'public' folder
+          entryPoint: './' 
